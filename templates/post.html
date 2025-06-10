@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="{{ theme_css_path }}" />
+    <title>{{ title }}</title>
+  </head>
+  <body>
+    <main class="main-content blog-main-content">
+      <div class="main-content-inner">
+        <nav><a href="/">Noratrieb</a></nav>
+        <h1>{{ title }}</h1>
+        <hr />
+        <div>{{ body | safe }}</div>
+      </div>
+    </main>
+  </body>
+</html>

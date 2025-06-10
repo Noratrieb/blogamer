@@ -4,7 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+askama = "0.14.0"
+bs58 = "0.5.1"
+clap = { version = "4.5.40", features = ["derive"] }
 color-eyre = "0.6.5"
+image = "0.25.6"
 pulldown-cmark = "0.13.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_norway = "0.9.42"
+sha2 = "0.10.9"
+
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.rav1e]
+opt-level = 3

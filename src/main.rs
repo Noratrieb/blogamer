@@ -1,5 +1,6 @@
-use std::{path::Path};
+use clap::Parser;
 
 fn main() -> color_eyre::Result<()> {
-    blogamer::generate("output".into(), Path::new("example"))
+    let opts = blogamer::Opts::parse();
+    blogamer::generate(opts)
 }

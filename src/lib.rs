@@ -1,37 +1,111 @@
+use askama::Template;
 use color_eyre::{
     Result,
     eyre::{OptionExt, WrapErr, bail, ensure},
 };
-use pulldown_cmark::Options;
+use pulldown_cmark::{Event, Options, Tag, TagEnd};
+use sha2::Digest;
 use std::{
+    collections::HashMap,
     fs::DirEntry,
+    io,
     path::{Path, PathBuf},
 };
 
-use crate::context::Context;
+#[derive(clap::Parser)]
+pub struct Opts {
+    #[clap(long)]
+    optimize: bool,
+    #[clap(long, short)]
+    input: PathBuf,
+    #[clap(long, short)]
+    output: PathBuf,
+}
 
-mod context {
-    use std::collections::BTreeMap;
+pub struct Context {
+    opts: Opts,
+    static_files: HashMap<String, Vec<u8>>,
+    theme_css_path: String,
+}
 
-    #[derive(Default)]
-    pub struct Context {
-        output: OutputDirectory,
+struct PictureImages {
+    sources: Vec<PictureSource>,
+    fallback_path: String,
+    height: u32,
+    width: u32,
+}
+
+struct PictureSource {
+    path: String,
+    media_type: String,
+}
+
+impl Context {
+    fn add_static_file(&mut self, name: &str, ext: &str, content: Vec<u8>) -> Result<String> {
+        let name = format!("{name}-{}{ext}", create_hash_string(&content));
+        let _ = self.static_files.insert(name.clone(), content);
+        Ok(format!("/static/{name}"))
     }
 
-    #[derive(Default)]
-    struct OutputDirectory {
-        entries: BTreeMap<String, OutputFile>
-    }
+    fn add_image(&mut self, path: &Path) -> Result<PictureImages> {
+        let image = image::ImageReader::open(path)
+            .wrap_err("reading image")?
+            .decode()
+            .wrap_err("decoding image")?;
 
-    enum OutputFile {
-        Dir(OutputDirectory),
-        BinaryFile(Vec<u8>),
-        StringFile(String),
-    }
+        let name = path
+            .file_stem()
+            .ok_or_eyre("image does not have name")?
+            .to_str()
+            .unwrap();
 
-    impl Context {
-        
+        let optimize = self.opts.optimize;
+
+        let mut encode = |format, ext| -> Result<_> {
+            let mut bytes = vec![];
+            image.write_to(&mut io::Cursor::new(&mut bytes), format)?;
+
+            self.add_static_file(name, ext, bytes)
+        };
+
+        let fallback_path = encode(image::ImageFormat::Jpeg, ".jpg")?;
+
+        let sources = if optimize {
+            let avif_path = encode(image::ImageFormat::Avif, ".avif")?;
+            let webp_path = encode(image::ImageFormat::WebP, ".webp")?;
+            vec![
+                PictureSource {
+                    path: avif_path,
+                    media_type: "image/avif".to_owned(),
+                },
+                PictureSource {
+                    path: webp_path,
+                    media_type: "image/webp".to_owned(),
+                },
+            ]
+        } else {
+            vec![]
+        };
+
+        Ok(PictureImages {
+            sources,
+            fallback_path,
+            height: image.height(),
+            width: image.width(),
+        })
     }
+}
+
+fn create_hash_string(bytes: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(bytes);
+    bs58::encode(&digest[..16]).into_string()
+}
+
+struct Post {
+    name: String,
+    relative_to: PathBuf,
+    frontmatter: Frontmatter,
+    body_md: String,
 }
 
 mod write {
@@ -39,38 +113,53 @@ mod write {
     use std::path::Path;
 
     pub fn initialize(base: &Path) -> Result<()> {
-        std::fs::remove_dir_all(base).wrap_err("deleting previous output")?;
+        let _ = std::fs::remove_dir_all(base).wrap_err("deleting previous output");
         Ok(std::fs::create_dir_all(base).wrap_err("creating output")?)
-    }
-
-    pub fn write_file(base: &Path, name: &str, content: &str) -> Result<()> {
-        Ok(std::fs::write(base.join(name), content)?)
     }
 }
 
-pub fn generate(out_base: PathBuf, root: &Path) -> Result<()> {
-    let mut ctx = Context::default();
+pub fn generate(opts: Opts) -> Result<()> {
+    let mut ctx = Context {
+        opts,
+        static_files: Default::default(),
+        theme_css_path: String::new(),
+    };
 
-    collect_posts(&mut ctx, &root.join("posts"))
-        .wrap_err_with(|| format!("reading posts from {}", root.display()))?;
+    ctx.theme_css_path = ctx
+        .add_static_file(
+            "theme",
+            ".css",
+            include_bytes!("../templates/theme.css")
+                .as_slice()
+                .to_owned(),
+        )
+        .wrap_err("adding theme.css")?;
 
-    write::initialize(&out_base).wrap_err("initializing output")?;
-    for output in ctx.outputs {
-        match output {
-            OutputFile::Post {
-                name,
-                frontmatter,
-                html_body,
-            } => {
-                write::write_file(&out_base, &name, &html_body)?;
-            }
-        }
+    let posts = collect_posts(&ctx.opts.input.join("posts"))
+        .wrap_err_with(|| format!("reading posts from {}", ctx.opts.input.display()))?;
+
+    write::initialize(&ctx.opts.output).wrap_err("initializing output")?;
+
+    for post in posts {
+        let dir = ctx.opts.output.join("blog").join("posts").join(&post.name);
+        std::fs::create_dir_all(&dir)?;
+
+        let html = render_post(&mut ctx, &post)?;
+
+        std::fs::write(dir.join("index.html"), html)?;
+    }
+
+    let static_dir = ctx.opts.output.join("static");
+    std::fs::create_dir(&static_dir).wrap_err("creating static")?;
+    for (name, content) in ctx.static_files {
+        std::fs::write(static_dir.join(name), content).wrap_err("writing static file")?;
     }
 
     Ok(())
 }
 
-fn collect_posts(ctx: &mut Context, path: &Path) -> Result<()> {
+fn collect_posts(path: &Path) -> Result<Vec<Post>> {
+    let mut posts = vec![];
     let entries = std::fs::read_dir(path)?;
 
     for entry in entries {
@@ -78,27 +167,39 @@ fn collect_posts(ctx: &mut Context, path: &Path) -> Result<()> {
         let name = entry.file_name();
         let name = name.to_str().ok_or_eyre("invalid UTF-8 filename")?;
 
-        collect_post(ctx, &entry, name).wrap_err_with(|| format!("generating post {name}"))?;
+        let post =
+            collect_post(&entry, name).wrap_err_with(|| format!("generating post {name}"))?;
+        posts.push(post);
     }
 
-    Ok(())
+    Ok(posts)
 }
 
-fn collect_post(ctx: &mut Context, entry: &DirEntry, name: &str) -> Result<()> {
+fn collect_post(entry: &DirEntry, name: &str) -> Result<Post> {
     let meta = entry.metadata()?;
-    if meta.is_dir() {
-        todo!("directory post");
-    }
 
-    let Some((name, ext)) = name.split_once('.') else {
-        bail!("invalid post filename {name}, must be *.md");
+    let (name, content, relative_to) = if meta.is_dir() {
+        let content_path = entry.path().join("index.md");
+        let content = std::fs::read_to_string(&content_path)
+            .wrap_err_with(|| format!("could not read {}", content_path.display()))?;
+
+        (name.to_owned(), content, entry.path())
+    } else {
+        let Some((name, ext)) = name.split_once('.') else {
+            bail!("invalid post filename {name}, must be *.md");
+        };
+        ensure!(
+            ext == "md",
+            "invalid filename {name}, only .md extensions are allowed"
+        );
+        let content = std::fs::read_to_string(entry.path()).wrap_err("reading contents")?;
+
+        (
+            name.to_owned(),
+            content,
+            entry.path().parent().unwrap().to_owned(),
+        )
     };
-    ensure!(
-        ext == "md",
-        "invalid filename {name}, only .md extensions are allowed"
-    );
-
-    let content = std::fs::read_to_string(entry.path()).wrap_err("reading contents")?;
 
     let rest = content
         .strip_prefix("---\n")
@@ -110,15 +211,12 @@ fn collect_post(ctx: &mut Context, entry: &DirEntry, name: &str) -> Result<()> {
     let frontmatter =
         serde_norway::from_str::<Frontmatter>(frontmatter).wrap_err("¡nvalid frontmatter")?;
 
-    let html_body = parse_post_body(&body).wrap_err("parsing post")?;
-
-    ctx.outputs.push(OutputFile::Post {
-        name: name.to_owned(),
+    Ok(Post {
+        name,
         frontmatter,
-        html_body,
-    });
-
-    Ok(())
+        body_md: body.to_owned(),
+        relative_to,
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -127,12 +225,81 @@ struct Frontmatter {
     date: String,
 }
 
-fn parse_post_body(content: &str) -> Result<String> {
+fn render_post(ctx: &mut Context, post: &Post) -> Result<String> {
+    #[derive(askama::Template)]
+    #[template(path = "../templates/post.html")]
+    struct PostTemplate<'a> {
+        title: &'a str,
+        body: &'a str,
+        theme_css_path: &'a str,
+    }
+
+    let body = render_body(ctx, &post.relative_to, &post.body_md)?;
+
+    PostTemplate {
+        title: &post.frontmatter.title,
+        body: &body,
+        theme_css_path: &ctx.theme_css_path,
+    }
+    .render()
+    .wrap_err("failed to render template")
+}
+
+fn render_body(ctx: &mut Context, relative_to: &Path, md: &str) -> Result<String> {
     let mut options = pulldown_cmark::Options::empty();
     options |= Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES | Options::ENABLE_STRIKETHROUGH;
-    let parser = pulldown_cmark::Parser::new_ext(content, options);
+    let mut parser = pulldown_cmark::Parser::new_ext(md, options);
 
-    let mut output = String::new();
-    pulldown_cmark::html::push_html(&mut output, parser);
-    Ok(output)
+    let mut events = vec![];
+
+    while let Some(ev) = parser.next() {
+        dbg!(&ev);
+        match ev {
+            Event::Start(Tag::Image {
+                link_type: _,
+                dest_url,
+                title: _,
+                id: _,
+            }) => {
+                let Some(Event::Text(alt)) = parser.next() else {
+                    bail!("No alt text for image tag");
+                };
+                let Some(Event::End(TagEnd::Image)) = parser.next() else {
+                    bail!("No end tag for image");
+                };
+
+                let sources = ctx.add_image(&relative_to.join(dest_url.as_ref()))?;
+
+                events.extend([
+                    Event::Start(Tag::HtmlBlock),
+                    Event::Html("<picture>".into()),
+                ]);
+                for source in sources.sources {
+                    events.push(Event::Html(
+                        format!(
+                            r#"<source srcset="{}" type="{}">"#,
+                            source.path, source.media_type
+                        )
+                        .into(),
+                    ));
+                }
+                events.extend([
+                    Event::Html(
+                        format!(
+                            r#"<img src="{}" alt="{}" height="{}" width="{}">"#,
+                            sources.fallback_path, alt, sources.height, sources.width
+                        )
+                        .into(),
+                    ),
+                    Event::Html("</picture>".into()),
+                    Event::End(TagEnd::HtmlBlock),
+                ]);
+            }
+            ev => events.push(ev),
+        }
+    }
+
+    let mut body = String::new();
+    pulldown_cmark::html::push_html(&mut body, events.into_iter());
+    Ok(body)
 }
